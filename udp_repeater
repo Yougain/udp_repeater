@@ -4,8 +4,7 @@ require 'socket'
 require 'ipaddr'
 require 'securerandom'
 
-
-
+# UDP repeater
 sport = nil
 cport = nil
 chost = nil
