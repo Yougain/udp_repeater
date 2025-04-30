@@ -1,8 +1,32 @@
 #!/bin/env ruby
 
+# encoding: ASCII-8BIT
+
+Encoding.default_external = Encoding::ASCII_8BIT
+Encoding.default_internal = Encoding::ASCII_8BIT
+
+begin
+    require 'Yk/debug2'
+rescue LoadError
+    require 'tz/debug2'
+end
 require 'socket'
 require 'ipaddr'
 require 'securerandom'
+require 'digest'
+
+class String
+    def md5
+        Digest::MD5.hexdigest self
+    end
+end
+
+STDERR.puts "あ".encoding
+STDERR.puts "あ".size.inspect
+
+
+DEBUG = true
+#p > "res"
 
 # UDP repeater
 sport = nil
@@ -101,18 +125,14 @@ class PacketQueue
         @queue = Array.new
     end
     def getChunkManager packet_no
-        if @first && packet_no < @first - 100 ||  @last && @last + 100 < packet_no
+        if @first && (packet_no < @first - 100 ||  @first + @queue.size + 100 < packet_no)
             @queue.clear
             @first = nil
         end
         @first ||= packet_no
         pos = packet_no - @first
         if pos < 0
-            @first = packet_no
-            while pos < 0
-                @queue.unshift ChunkManager.new
-                pos += 1
-            end
+            return nil
         elsif pos > @queue.size
             (pos - @queue.size).times do
                 @queue.push ChunkManager.new
@@ -125,6 +145,7 @@ class PacketQueue
         while !@queue.empty? && @queue.first.ready?
             @queue.shift.flush do |tdata|
                 yield tdata
+                @first += 1
             end
         end
     end
@@ -138,9 +159,11 @@ class ChunkManager
     def self.register addr, port, packet_no, chunk_no, data_size, data
         pq = PacketQueue.emerge addr, port
         cm = pq.getChunkManager packet_no
-        cm.addChunk chunk_no, data_size, data
-        pq.flush do |tdata|
-            yield tdata
+        if cm
+            cm.addChunk chunk_no, data_size, data
+            pq.flush do |tdata|
+                yield tdata
+            end
         end
     end
     def initialize
@@ -151,7 +174,7 @@ class ChunkManager
     def addChunk chunk_no, data_size, data
         @chunks[chunk_no] && return
         @chunks[chunk_no] = data
-        @size += data.size
+        @size += data.bytesize
         if @size >= data_size
             @data_ready = true
         end
@@ -177,61 +200,58 @@ if LPORT # client
         lsocket.bind('0.0.0.0', LPORT)
         rsocket = UDPSocket.new
         rsocket.bind('0.0.0.0', 0)
+        oport = 100
         loop do
-            p 0
+            oaddr = nil
             rs, = select [lsocket, rsocket], nil, nil
-            p rs
             if rs
-                p 1
-                if rs.include? lsocket
-                    p 2
+                if rs.include? lsocket # from zoiper
                     data, _addr = lsocket.recvfrom(RcvPacketSz)
                     oaddr = _addr[3]
                     oport = _addr[1]
-                    packet_no = Counter[[addr, port]] += 1
+                    packet_no = Counter[[oaddr, oport]] += 1
                     chunk_no = 0
-                    data_size = data.size
-                    p data_size
-                    p data
+                    data_size = data.bytesize
                     cur_pos = 0
                     chunk_no = 0
+                    #if false
                     loop do
-                        p 3
                         header = Marshal.dump [oaddr, oport, packet_no, chunk_no, data_size, ID]
-                        header_sz = header.size
-                        p header_sz
+                        header_sz = header.bytesize
                         chunk_sz_max = SndPacketSz - 4 - header_sz
                         chunk_sz = [chunk_sz_max, data_size - cur_pos].min
-                        p chunk_sz
                         data_chunk = data[cur_pos, chunk_sz]
                         cur_pos += chunk_sz
                         to_send = [header_sz, chunk_sz].pack('S<S<') + header + data_chunk
-                        puts "Packed data: #{to_send.bytes}"
+                        p [:client_to_server, oaddr, oport, packet_no, chunk_no, data_chunk.md5]
                         REPEAT.times do
-                            rsocket.send(to_send, 0, RHOST, RPORT)
+                            rsocket.send(to_send, 0, RHOST, RPORT) # client to server
                         end
                         chunk_no += 1
                         break if cur_pos >= data_size
                     end
+                    #else
+                    #    rsocket.send(data, 0, RHOST, RPORT)
+                    #end
                 end
-                if rs.include? rsocket
-                    p 4
+                if rs.include? rsocket # from server
                     data, = rsocket.recvfrom(RcvPacketSz)
+                    p data.encoding
+                    #if true
                     header_sz, chunk_sz = data[0..3].unpack('S<S<')
                     header = data[4, header_sz]
                     oaddr, oport, packet_no, chunk_no, data_size, id = Marshal.load(header) rescue nil
-                    p oaddr
-                    p oport
-                    p packet_no
-                    p chunk_no
-                    p data_size
-                    p id
-                    p ID
                     next if id != ID
-                    p :sending
-                    ChunkManager.register oaddr, oport, packet_no, chunk_no, data_size, data[4 + header_sz, chunk_sz] do |tdata|
-                        lsocket.send(tdata, 0, oaddr, oport)
+                    tdata = data[4 + header_sz, chunk_sz]
+                    ChunkManager.register oaddr, oport, packet_no, chunk_no, data_size, tdata do |td|
+                        p [:client_to_zoiper, oaddr, oport, packet_no, chunk_no, td.md5]
+                        lsocket.send(td, 0, oaddr, oport) # client to zoiper
                     end
+                    #else
+                    #    p data.md5
+                    #    p data.encoding
+                    #    lsocket.send(data, 0, oaddr, oport.to_i)
+                    #end
                 end
             end
         end
@@ -259,49 +279,50 @@ else # server
             if rs
                 rs.each do |socket|
                     if csocketList.values.include? socket
-                        data, _addr = socket.recvfrom(RcvPacketSz)
+                        data, _addr = socket.recvfrom(RcvPacketSz) # from asterisk
                         addr = _addr[3]
                         port = _addr[1]
-                        packet_no = Counter[[addr, port]] += 1
+                        packet_no = Counter[[socket.oaddr, socket.oport, socket.id]] += 1
                         chunk_no = 0
-                        data_size = data.size
+                        data_size = data.bytesize
                         cur_pos = 0
                         loop do
                             header = Marshal.dump [socket.oaddr, socket.oport, packet_no, chunk_no, data_size, socket.id]
-                            header_sz = header.size
-                            p header_sz
+                            header_sz = header.bytesize
                             chunk_sz_max = SndPacketSz - 4 - header_sz
                             chunk_sz = [chunk_sz_max, data_size - cur_pos].min
-                            p chunk_sz
                             data_chunk = data[cur_pos, chunk_sz]
                             cur_pos += chunk_sz
                             to_send = [header_sz, chunk_sz].pack('S<S<') + header + data_chunk
+                            STDERR.puts  [:server_to_client, socket.oaddr, socket.oport, packet_no, chunk_no, data_chunk.md5].inspect
                             REPEAT.times do
-                                socket.send(to_send, 0, socket.paddr, socket.pport)
+                                ssocket.send(to_send, 0, socket.paddr, socket.pport) # server to client
                             end
                             chunk_no += 1
                             break if cur_pos >= data_size
                         end
                     elsif socket == ssocket
-                        data, _addr = ssocket.recvfrom(RcvPacketSz)
-                        paddr = _addr[3]
+                        data, _addr = ssocket.recvfrom(RcvPacketSz) # from client
+                        paddr = _addr[3] # client mobile address
                         pport = _addr[1]
                         header_sz, chunk_sz = data[0..3].unpack('S<S<')
                         header = data[4, header_sz]
                         oaddr, oport, packet_no, chunk_no, data_size, id = Marshal.load(header) rescue nil
-                        csocket = csocketList[[addr, port, id]]
-                        if !csocket
-                            s = UDPSocket.new
-                            csocketList[[addr, port, id]] = s
-                            s.bind('0.0.0.0', 0)
-                            s.set_pinfo(paddr, pport, oaddr, oport, id)
-                            csocket = s
-                        end
-                        p [header_sz, chunk_sz]
-                        ChunkManager.register addr, port, packet_no, chunk_no, data_size, data[4 + header_sz, chunk_sz] do |tdata|
-                            p tdata
-                            p csocket
-                            csocket.send(tdata, 0, CHOST, CPORT)
+                        if id
+                            csocket = csocketList[[oaddr, oport, id]]
+                            if !csocket
+                                s = UDPSocket.new
+                                csocketList[[oaddr, oport, id]] = s
+                                s.bind('0.0.0.0', 0)
+                                s.set_pinfo(paddr, pport, oaddr, oport, id)
+                                csocket = s
+                            end
+                            #STDERR.puts [oaddr, oport, packet_no, chunk_no, data_size].inspect
+                            ChunkManager.register oaddr, oport, packet_no, chunk_no, data_size, data[4 + header_sz, chunk_sz] do |tdata|
+                                STDERR.puts [:server_to_asterisk, oaddr, oport, packet_no, chunk_no, tdata.md5].inspect
+                                csocket.send(tdata, 0, CHOST, CPORT) # server to asterisk
+                            #csocket.send(data[4 + header_sz, chunk_sz], 0, CHOST, CPORT) # server to asterisk
+                            end
                         end
                     end
                 end
