@@ -236,7 +236,6 @@ if LPORT # client
                 end
                 if rs.include? rsocket # from server
                     data, = rsocket.recvfrom(RcvPacketSz)
-                    p data.encoding
                     #if true
                     header_sz, chunk_sz = data[0..3].unpack('S<S<')
                     header = data[4, header_sz]
