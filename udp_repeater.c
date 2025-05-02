@@ -10,9 +10,13 @@
 #include <stdint.h> // uint32_tを使用するために必要
 #include <pthread.h> // スレッドを使用するために必要
 #include <time.h>    // UNIX時刻を取得するために必要
+#include <linux/time.h>
 
-#define BUFFER_SIZE 65536
 #define SOURCE_FILE "~/.udp_repeater_source"
+
+int is_server_mode = 0;
+uint32_t packet_sno = 0; // シリアル番号を初期化
+uint64_t current_time = 0; // UNIX時刻を初期化
 
 void resolve_path(const char *path, char *resolved_path, size_t size) {
     if (path[0] == '~') {
@@ -28,45 +32,153 @@ void resolve_path(const char *path, char *resolved_path, size_t size) {
     }
 }
 
-void add_timestamp_and_counter(char *buffer, ssize_t *recv_len, uint64_t timestamp, uint32_t *counter) {
-    uint64_t timestamp_network_order = htobe64(timestamp); // ネットワークバイトオーダーに変換
-    uint32_t counter_network_order = htonl(*counter); // ネットワイトオーダーに変換
+uint32_t rpacket_index_top = (uint32_t)-1; // インデックスtopを初期化
+uint32_t rpacket_index_bottom = (uint32_t)-1; // インデックスbottomを初期化
 
-    memmove(buffer + sizeof(uint64_t) + sizeof(uint32_t), buffer, *recv_len); // データを後ろにずらす
-    memcpy(buffer, &timestamp_network_order, sizeof(uint64_t)); // UNIX時刻を先頭に追加
-    memcpy(buffer + sizeof(uint64_t), &counter_network_order, sizeof(uint32_t)); // カウンターを追加
-    *recv_len += sizeof(uint64_t) + sizeof(uint32_t); // パケットサイズを更新
-    (*counter)++; // カウンターをインクリメント
+#define PACKET_SIZE 2048
+#define BUFFERED_PACKET_SIZE (PACKET_SIZE - sizeof(uint16_t)) // パケットサイズ
+struct __attribute__((packed)) Packet {
+    uint16_t packet_len; // パケットサイズ
+    char data[PACKET_SIZE]; // パケットデータ
+};
+
+struct __attribute__((packed)) BufferedPacket {
+    uint16_t packet_len; // パケットサイズ
+    char data[BUFFERED_PACKET_SIZE]; // パケットデータ
+} bufferedPackets[1024]; // 1024個収容可能なバッファ
+#define bufferedPacketPtr(index) (&bufferedPackets[(index) % 1024]) // bufferedPacketのポインタを取得するマクロ
+
+struct __attribute__((packed)) UnarrivedInfoPacket {
+    uint16_t packet_len; // パケットサイズ
+    uint64_t time; // 時刻
+    uint32_t sno; // = -1; シリアル番号
+    uint32_t unarrived[1024]; // 到着していないパケット番号を格納する配列
+}; // PACKET_SIZEバイトのパケットを1024個収容可能なバッファ
+
+
+#define TAGGED_DATA_SIZE (PACKET_SIZE - sizeof(uint64_t) - sizeof(uint32_t))
+struct __attribute__((packed)) TaggedPacket {
+    uint16_t packet_len; // パケットサイズ
+    uint64_t time; // 時刻
+    uint32_t sno; // = -1; シリアル番号
+    char data[TAGGED_DATA_SIZE]; // 到着していないパケット番号を格納する配列
+} taggedPackets[1024]; // 1024個収容可能なバッファ
+#define taggedPacketPtr(index) (&taggedPackets[(index) % 1024]) // bufferedPacketのポインタを取得するマクロ
+
+void add_timestamp_and_sno(struct Packet* packet) {
+    uint64_t timestamp_network_order = htobe64(current_time); // ネットワークバイトオーダーに変換
+    uint32_t sno_network_order = htonl(packet_sno); // ネットワイトオーダーに変換
+
+    struct TaggedPacket *tp = taggedPacketPtr(packet_sno);
+    tp->packet_len = packet->packet_len + sizeof(uint64_t) + sizeof(uint32_t); // 受信したパケットのサイズにタグのサイズを加えて格納
+    tp->time = timestamp_network_order; // ネットワークバイトオーダーのUNIX時刻を格納
+    tp->sno = sno_network_order; // ネットワークバイトオーダーのシリアル番号を格納
+    memcpy(tp->data, packet->data, packet->packet_len); // 受信したパケットのデータを格納
+    (packet_sno)++; // シリアル番号をインクリメント
 }
 
+
+
+int recvFrom(struct Packet* packet, int sock, struct sockaddr_in* client_addr, socklen_t *addr_len) {
+    ssize_t recv_len = recvfrom(sock, (char*)&packet->data, PACKET_SIZE, 0,
+                                (struct sockaddr *)client_addr, addr_len);
+    packet->packet_len = recv_len; // 受信したパケットのサイズを格納
+    return (int)recv_len; // 受信したパケットのサイズを返す
+}
+
+#define isUnarrived(index) (bufferedPacketPtr(index)->packet_len == 0 || (uint16_t)-16 < bufferedPacketPtr(index)->packet_len) // 到着していないパケットか再送有給が上限に達したパケットを判定するマクロ
+#define isUnarrivedMax(index) (bufferedPacketPtr(index)->packet_len == (uint16_t)-16) // 到着していないパケットを判定するマクロ
+#define incUnarrived(index) (--bufferedPacketPtr(index)->packet_len) // 到着していないパケットを判定するマクロ
+
 // パケットの先頭64ビットをUNIX時刻として解釈し、判定する関数
-// 60秒以上ずれていない場合は、先頭のUNIX時刻と32ビットカウンターを削除
-int validate_and_strip_packet(char *buffer, ssize_t *len, uint64_t current_time) {
-    if (*len < sizeof(uint64_t) + sizeof(uint32_t)) {
-        printf("Dropped packet: too small to contain a valid timestamp and counter.\n");
+// 60秒以上ずれていない場合は、先頭のUNIX時刻と32ビットシリアル番号を削除
+int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, struct UnarrivedInfoPacket *unrarrivedInfoPacket) {
+    uint16_t len = packet->packet_len; // パケットサイズを取得
+    if (len < sizeof(uint64_t) + sizeof(uint32_t)) {
+        printf("Dropped packet: too small to contain a valid timestamp and sno.\n");
         return 0; // 無効なパケット
     }
 
-    uint64_t received_timestamp;
-    memcpy(&received_timestamp, buffer, sizeof(uint64_t));
-    received_timestamp = be64toh(received_timestamp); // ネットワークバイトオーダーをホストバイトオーダーに変換
+    uint64_t time_stamp = be64toh(packet->time); // ネットワークバイトオーダーをホストバイトオーダーに変換
 
     // 現在の時刻と比較
-    if (llabs((int64_t)(received_timestamp - current_time)) > 60) {
+    if (llabs((int64_t)(time_stamp - current_time)) > 60) {
         printf("Dropped packet: timestamp %lu is out of sync with current time %lu.\n",
-               received_timestamp, current_time);
+            time_stamp, current_time);
         return 0; // 無効なパケット
     }
 
-    // パケットの先頭からUNIX時刻とカウンターを削除
-    memmove(buffer, buffer + sizeof(uint64_t) + sizeof(uint32_t), *len - (sizeof(uint64_t) + sizeof(uint32_t)));
-    *len -= sizeof(uint64_t) + sizeof(uint32_t); // パケットサイズを更新
+    // 32ビットのシリアル番号を取得
+    uint32_t p_sno = ntohl(packet->sno); // ネットワークバイトオーダーをホストバイトオーダーに変換
+
+    if(p_sno == (uint32_t)-1) {
+        return -1; // ユーティリティパケット
+    }
+    // rpacket_index_bottomの更新
+    if (rpacket_index_bottom == (uint32_t)-1) {
+        rpacket_index_bottom = p_sno;
+    }
+
+    // rpacket_index_topの更新
+    if (rpacket_index_top == (uint32_t)-1) {
+        rpacket_index_top = p_sno;
+    }else if ((rpacket_index_top > 1024 && p_sno < rpacket_index_top - 1024) || rpacket_index_top + 1024 < p_sno) {
+        // rpacket_index_topが1024以上で、snoがrpacket_index_top-1024より小さい場合、またはrpacket_index_top+1024より大きい場合
+        // rpacket_index_topをsnoに更新
+        rpacket_index_top = p_sno + 1;
+        rpacket_index_bottom = p_sno;
+    }else if (rpacket_index_top <= p_sno) { //新しいパケット
+        // rpacket_index_topからsno-1までの範囲（まだ到着していない）をゼロクリア
+        for (; rpacket_index_top < p_sno - 1; ++rpacket_index_top) 
+            bufferedPacketPtr(rpacket_index_top)->packet_len = 0; // 先頭2バイトをゼロクリア
+        rpacket_index_top = p_sno + 1;
+    }else if(bufferedPacketPtr(p_sno)->packet_len != 0) {
+        return 0; // 無効なパケット。既にデータが到着している。
+    }
+
+    // パケットのサイズ（UNIX時刻とシリアル番号を除いたサイズ）を計算
+    uint16_t payload_size = len - (sizeof(uint64_t) + sizeof(uint32_t));
+
+    // rpacketにサイズと内容を格納
+    bufferedPacketPtr(p_sno)->packet_len = payload_size; // 先頭2バイトにサイズを格納
+    memcpy(bufferedPacketPtr(p_sno)->data, packet->data, payload_size); // 内容を格納
+
+    //--------連続したパケットをpbufferとpktCountで指定する---------------
+    uint32_t i = rpacket_index_bottom, j = 0;
+    for(; i < rpacket_index_top; ++i)
+        if (isUnarrived(i)){
+            // パケットが到着していない場合で、再送要求が上限に達していない場合
+            if(j < 250){ //最大限送信可能
+                incUnarrived(i);
+                unrarrivedInfoPacket->unarrived[j++] = i; // 到着していないパケット番号を格納
+            }
+            break;
+        }
+    *pktCount = i - rpacket_index_bottom; // 先頭から連続して受信済みパケットの数を返す
+    for(; i < rpacket_index_top; ++i)
+        if (isUnarrived(i)){
+            // パケットが到着していない場合
+            if(j < 250){ //最大限送信可能
+                incUnarrived(i);
+                unrarrivedInfoPacket->unarrived[j++] = i; // 到着していないパケット番号を格納
+            }
+            break;
+        }
+    if(j > 0){
+        unrarrivedInfoPacket->unarrived[j++] = (u_int32_t)-1; // 到着していないパケット番号の終端を示す
+        unrarrivedInfoPacket->packet_len = sizeof(uint64_t) + sizeof(uint32_t) + j * sizeof(uint32_t); // パケットサイズを計算
+        unrarrivedInfoPacket->sno = htonl(-1); // ネットワークバイトオーダーで-1を格納
+        unrarrivedInfoPacket->time = htobe64(current_time); // ネットワークバイトオーダーのUNIX時刻を格納
+    }else{
+        unrarrivedInfoPacket->packet_len = 0; // パケットサイズを計算
+    }
+    //--------穴の空いたパケット番号をユーティリティパケットに格納して返送する--------
+
 
     return 1; // 有効なパケット
 }
 
 int fr, fw; // パイプの読み取り用と書き込み用
-uint64_t t; // 64ビットのUNIX時刻を格納する変数
 
 // 別スレッドで10秒ごとにfwに'\0'を書き込む関数
 void *timer_thread(void *arg) {
@@ -78,8 +190,66 @@ void *timer_thread(void *arg) {
     return NULL;
 }
 
+
+void send_packet(int sock, struct sockaddr_in* addr, struct Packet* packet) {
+    ssize_t sent_len = sendto(sock, packet->data, packet->packet_len, 0,
+                            (struct sockaddr *)addr, sizeof(*addr));
+    if (sent_len < 0) {
+        perror("sendto");
+    } else {
+        printf("Sent packet with timestamp %lu and sno %u to forward destination.\n", current_time, packet_sno - 1);
+    }
+}
+
+
+void trans_packet(int to_inner, int sock, struct sockaddr_in* addr, struct Packet* packet, int peer_sock, struct sockaddr_in* peer_addr) {
+    size_t pktCount;
+    struct UnarrivedInfoPacket unrarrivedInfoPacket;
+    if (to_inner) {
+        // パケットを検証して先頭のUNIX時刻とシリアル番号を削除。パケットバッファに格納して、連続している受信済パケットの範囲をpbufferとpktCountに返す
+        switch (validate_and_strip_packet((struct TaggedPacket *)packet, &pktCount, &unrarrivedInfoPacket)) {
+        case 0:
+            return; // 無効なパケットを破棄
+        case -1:
+            // 未着再送信要求の場合
+            // 処理をする
+            struct UnarrivedInfoPacket* requestPacket = (struct UnarrivedInfoPacket *)packet;
+            for(uint32_t* ptr = &requestPacket->unarrived; *ptr != (uint32_t)-1; ++ptr) {
+                uint32_t i = *ptr;
+                if (i < packet_sno - 1024 || packet_sno <= i) {
+                    // 到着していないパケット番号が範囲外の場合
+                    printf("Invalid unarrived packet number: %u\n", i);
+                    continue;
+                }
+                // 到着していないパケットを再送する
+                send_packet(peer_sock, peer_addr, (struct Packet*)taggedPacketPtr(i));
+            }
+            return;
+        }
+        printf("Received valid packet from forward destination, sending back to source...\n");
+        if (addr->sin_port != 0)
+            for (size_t i = rpacket_index_bottom; i < rpacket_index_bottom + pktCount; ++i){
+                // 転送先にパケットを送信
+                if(!isUnarrivedMax(i)) // 再送要求限度を超えても到着していないパケット番号をスキップ
+                    send_packet(sock, addr, (struct Packet*)bufferedPacketPtr(i));
+            }
+        if (unrarrivedInfoPacket.packet_len > 0) {
+            // 到着していないパケット番号を返送
+            send_packet(peer_sock, peer_addr, (struct Packet*)&unrarrivedInfoPacket);
+        }
+    }else{
+        // パケットサイズとUNIX時刻とシリアル番号を付加する
+        // packet_snoをインクリメント
+        add_timestamp_and_sno(packet);
+        pktCount = 1;
+        send_packet(sock, addr, (struct Packet*)taggedPacketPtr(packet_sno - 1)); // taggedPacketsのポインタを取得
+    }
+
+}
+
+
 int main(int argc, char *argv[]) {
-    int is_server_mode = 0;
+    // PACKET_SIZEバイトを1024個収容可能なバッファを作成してゼロで初期化
 
     // コマンドライン引数を解析
     for (int i = 1; i < argc; i++) {
@@ -108,8 +278,8 @@ int main(int argc, char *argv[]) {
     // tを現在時刻で初期化
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    t = (uint64_t)ts.tv_sec;
-    printf("Initialized timestamp: %lu\n", t);
+    current_time = (uint64_t)ts.tv_sec;
+    printf("Initialized current_time: %lu\n", current_time);
 
     char resolved_source_path[256];
     resolve_path(SOURCE_FILE, resolved_source_path, sizeof(resolved_source_path));
@@ -133,7 +303,6 @@ int main(int argc, char *argv[]) {
     int listen_sock, forward_sock;
     struct sockaddr_in listen_addr, forward_addr, client_addr, saved_client_addr;
     socklen_t addr_len = sizeof(client_addr);
-    char buffer[BUFFER_SIZE];
     fd_set read_fds;
     int max_fd;
 
@@ -213,7 +382,6 @@ int main(int argc, char *argv[]) {
 
     printf("Listening on port %d and forwarding to %s:%d\n", listen_port, forward_host, forward_port);
 
-    uint32_t packet_counter = 0; // カウンターを初期化
 
     while (1) {
         FD_ZERO(&read_fds);
@@ -238,15 +406,14 @@ int main(int argc, char *argv[]) {
             // 現在のUNIX時刻を取得してtに格納
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            t = (uint64_t)ts.tv_sec;
-            printf("Updated timestamp: %lu\n", t);
+            current_time = (uint64_t)ts.tv_sec;
+            printf("Updated current_time: %lu\n", current_time);
         }
 
+        struct Packet packet;
         if (FD_ISSET(listen_sock, &read_fds)) {
             // 待ち受けソケットからパケットを受信
-            ssize_t recv_len = recvfrom(listen_sock, buffer, BUFFER_SIZE - sizeof(uint64_t) - sizeof(uint32_t), 0,
-                                        (struct sockaddr *)&client_addr, &addr_len);
-            if (recv_len < 0) {
+            if (recvFrom(&packet, listen_sock, &client_addr, &addr_len) < 0) {
                 perror("recvfrom");
                 continue;
             }
@@ -264,57 +431,17 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if (is_server_mode) {
-                // パケットを検証して先頭のUNIX時刻とカウンターを削除
-                if (!validate_and_strip_packet(buffer, &recv_len, t)) {
-                    continue; // 無効なパケットを破棄
-                }
-
-                printf("Received valid packet from forward destination, sending back to source...\n");
-            }else{
-                // UNIX時刻とカウンターを付加して転送
-                add_timestamp_and_counter(buffer, &recv_len, t, &packet_counter);
-            }
-
-            ssize_t sent_len = sendto(forward_sock, buffer, recv_len, 0,
-                                      (struct sockaddr *)&forward_addr, sizeof(forward_addr));
-            if (sent_len < 0) {
-                perror("sendto");
-            } else {
-                printf("Sent packet with timestamp %lu and counter %u to forward destination.\n", t, packet_counter - 1);
-            }
+            trans_packet(is_server_mode, forward_sock, &forward_addr, &packet, listen_sock, &client_addr);
         }
 
         if (FD_ISSET(forward_sock, &read_fds)) {
             // 転送用ソケットからパケットを受信
-            ssize_t recv_len = recvfrom(forward_sock, buffer, BUFFER_SIZE, 0, NULL, NULL);
-            if (recv_len < 0) {
+            if (recvFrom(&packet, forward_sock, NULL, NULL) < 0){
                 perror("recvfrom");
                 continue;
             }
 
-            if (!is_server_mode) {
-                // パケットを検証して先頭のUNIX時刻とカウンターを削除
-                if (!validate_and_strip_packet(buffer, &recv_len, t)) {
-                    continue; // 無効なパケットを破棄
-                }
-
-                printf("Received valid packet from forward destination, sending back to source...\n");
-            }else{
-                // UNIX時刻とカウンターを付加して転送
-                add_timestamp_and_counter(buffer, &recv_len, t, &packet_counter);
-            }
-
-            // 送信元に返送
-            if (saved_client_addr.sin_port != 0) {
-                ssize_t sent_len = sendto(listen_sock, buffer, recv_len, 0,
-                                          (struct sockaddr *)&saved_client_addr, sizeof(saved_client_addr));
-                if (sent_len < 0) {
-                    perror("sendto");
-                }
-            } else {
-                printf("No source address available to send back to.\n");
-            }
+            trans_packet(!is_server_mode, listen_sock, &saved_client_addr, &packet, forward_sock, &forward_addr);
         }
     }
 
