@@ -31,6 +31,8 @@
 #include <stdarg.h>
 #include <errno.h> // For program_invocation_short_name
 #include <libgen.h> // For program_invocation_short_name
+#include <sys/stat.h>  // stat, mkdir関数のために必要
+#include <sys/types.h> // stat構造体のために必要
 
 // グローバル変数
 FILE *log_file = NULL;
@@ -42,6 +44,7 @@ void log_message(const char *file, const uint32_t line, const char *format, ...)
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
+    //puts(format);
 
     // ミリ秒単位の時刻を計算
     struct tm *tm_info = localtime(&tv.tv_sec);
@@ -55,14 +58,16 @@ void log_message(const char *file, const uint32_t line, const char *format, ...)
     pid_t pid = getpid();
 
     // ログメッセージをフォーマット
-    va_list args;
+    va_list args, args_copy;
     va_start(args, format);
     fprintf(log_file, "%s.%03ld %s[%d] ", time_buffer, milliseconds, process_name, pid);
     fprintf(stderr, "%s.%03ld %s[%d] ", time_buffer, milliseconds, process_name, pid);
     fprintf(log_file, "%s:%d ", file, line);
     fprintf(stderr, "%s:%d ", file, line);
-    vfprintf(log_file, format, args);
-    vfprintf(stderr, format, args);
+    char buff[4096];
+    vsnprintf(buff, 4096, format, args);
+    fputs(buff, stderr);
+    fputs(buff, log_file);
     fprintf(log_file, "\n");
     fprintf(stderr, "\n");
     va_end(args);
@@ -70,16 +75,32 @@ void log_message(const char *file, const uint32_t line, const char *format, ...)
     fflush(log_file); // ログを即時書き込み
 }
 
+void print_sockaddr(const struct sockaddr *addr) {
+    char ip_str[INET6_ADDRSTRLEN]; // IPv4とIPv6の両方に対応
+    uint16_t port;
+
+    if (addr->sa_family == AF_INET) {
+        // IPv4の場合
+        struct sockaddr_in *addr_in = (struct sockaddr_in *)addr;
+        inet_ntop(AF_INET, &(addr_in->sin_addr), ip_str, sizeof(ip_str));
+        port = ntohs(addr_in->sin_port);
+        fprintf(stderr, "IPv4 Address: %s, Port: %u\n", ip_str, port);
+    } else if (addr->sa_family == AF_INET6) {
+        // IPv6の場合
+        struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &(addr_in6->sin6_addr), ip_str, sizeof(ip_str));
+        port = ntohs(addr_in6->sin6_port);
+        fprintf(stderr, "IPv6 Address: %s, Port: %u\n", ip_str, port);
+    } else {
+        fprintf(stderr, "Unknown address family: %d\n", addr->sa_family);
+    }
+}
+
 #define LOG_MESSAGE(format, ...) \
     log_message(__FILE__, __LINE__, format, ##__VA_ARGS__)
+#define LOG_AND_EXIT(format, ...) \
+    (log_message(__FILE__, __LINE__, format, ##__VA_ARGS__), exit(EXIT_FAILURE))
 
-void log_and_exit(const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    LOG_MESSAGE(format, args);
-    va_end(args);
-    exit(EXIT_FAILURE);
-}
 
 // URLを解析してホスト名、パス、ポート番号を抽出する関数
 int parse_url(const char *url, char *hostname, char *path, uint16_t *port) {
@@ -428,7 +449,7 @@ struct __attribute__((packed)) TaggedPacket {
     uint32_t sno; // = -1; シリアル番号
     char data[TAGGED_DATA_SIZE]; // 到着していないパケット番号を格納する配列
 } taggedPackets[1024]; // 1024個収容可能なバッファ
-#define taggedPacketPtr(index) (&taggedPackets[(index) % 1024]) // bufferedPacketのポインタを取得するマクロ
+#define taggedPacketPtr(index) ((struct TaggedPacket*)&(taggedPackets[(index) % 1024])) // bufferedPacketのポインタを取得するマクロ
 
 void add_timestamp_and_sno(struct Packet* packet) {
     uint64_t timestamp_network_order = htobe64(current_time); // ネットワークバイトオーダーに変換
@@ -447,6 +468,8 @@ void add_timestamp_and_sno(struct Packet* packet) {
 int recvFrom(struct Packet* packet, int sock, struct sockaddr_in* client_addr, socklen_t *addr_len) {
     ssize_t recv_len = recvfrom(sock, (char*)&packet->data, PACKET_SIZE, 0,
                                 (struct sockaddr *)client_addr, addr_len);
+    LOG_MESSAGE("recvFrom: %d bytes from %s:%d\n",
+        (int)recv_len, inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
     packet->packet_len = recv_len; // 受信したパケットのサイズを格納
     return (int)recv_len; // 受信したパケットのサイズを返す
 }
@@ -460,7 +483,7 @@ int recvFrom(struct Packet* packet, int sock, struct sockaddr_in* client_addr, s
 int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, struct UnarrivedInfoPacket *unrarrivedInfoPacket) {
     uint16_t len = packet->packet_len; // パケットサイズを取得
     if (len < sizeof(uint64_t) + sizeof(uint32_t)) {
-        printf("Dropped packet: too small to contain a valid timestamp and sno.\n");
+        LOG_MESSAGE("Dropped packet: too small to contain a valid timestamp and sno.\n");
         return 0; // 無効なパケット
     }
 
@@ -468,7 +491,7 @@ int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, str
 
     // 現在の時刻と比較
     if (llabs((int64_t)(time_stamp - current_time)) > 120) {
-        printf("Dropped packet: timestamp %lu is out of sync with current time %lu.\n",
+        LOG_MESSAGE("Dropped packet: timestamp %lu is out of sync with current time %lu.\n",
             time_stamp, current_time);
         return 0; // 無効なパケット
     }
@@ -486,7 +509,7 @@ int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, str
 
     // rpacket_index_topの更新
     if (rpacket_index_top == (uint32_t)-1) {
-        rpacket_index_top = p_sno;
+        rpacket_index_top = p_sno + 1;
     }else if ((rpacket_index_top > 1024 && p_sno < rpacket_index_top - 1024) || rpacket_index_top + 1024 < p_sno) {
         // rpacket_index_topが1024以上で、snoがrpacket_index_top-1024より小さい場合、またはrpacket_index_top+1024より大きい場合
         // rpacket_index_topをsnoに更新
@@ -504,6 +527,7 @@ int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, str
 
     // パケットのサイズ（UNIX時刻とシリアル番号を除いたサイズ）を計算
     uint16_t payload_size = len - (sizeof(uint64_t) + sizeof(uint32_t));
+    LOG_MESSAGE("validate_and_strip_packet: packet_len = %d, payload_size = %d\n", len, payload_size);
 
     // rpacketにサイズと内容を格納
     bufferedPacketPtr(p_sno)->packet_len = payload_size; // 先頭2バイトにサイズを格納
@@ -521,6 +545,7 @@ int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, str
             break;
         }
     *pktCount = i - rpacket_index_bottom; // 先頭から連続して受信済みパケットの数を返す
+    rpacket_index_bottom += *pktCount; // 受信済みパケットの範囲を更新
     for(; i < rpacket_index_top; ++i)
         if (isUnarrived(i)){
             // パケットが到着していない場合
@@ -560,14 +585,13 @@ void *timer_thread(void *arg) {
 int sendCount = 5; // パケットを送信する回数
 
 void send_packet(int count, int sock, struct sockaddr_in* addr, struct Packet* packet) {
+    //print_sockaddr((struct sockaddr *)addr); // 送信先アドレスを表示
     for(int i = 0; i < count; ++i) {
+        LOG_MESSAGE("send_packet: packet->packet_len = %d\n", packet->packet_len);
         ssize_t sent_len = sendto(sock, packet->data, packet->packet_len, 0,
                                 (struct sockaddr *)addr, sizeof(*addr));
-        if (sent_len < 0) {
+        if (sent_len < 0)
             LOG_MESSAGE("Error sending packet: %s", strerror(errno));
-        } else {
-            LOG_MESSAGE("Sent packet with timestamp %lu and sno %u to forward destination.\n", current_time, packet_sno - 1);
-        }
     }
 }
 
@@ -575,15 +599,16 @@ void send_packet(int count, int sock, struct sockaddr_in* addr, struct Packet* p
 void trans_packet(int to_inner, int sock, struct sockaddr_in* addr, struct Packet* packet, int peer_sock, struct sockaddr_in* peer_addr) {
     size_t pktCount;
     struct UnarrivedInfoPacket* requestPacket;
-    struct UnarrivedInfoPacket unrarrivedInfoPacket;
+    struct UnarrivedInfoPacket unarrivedInfoPacket;
     if (to_inner) {
         // パケットを検証して先頭のUNIX時刻とシリアル番号を削除。パケットバッファに格納して、連続している受信済パケットの範囲をpbufferとpktCountに返す
-        switch (validate_and_strip_packet((struct TaggedPacket *)packet, &pktCount, &unrarrivedInfoPacket)) {
+        switch (validate_and_strip_packet((struct TaggedPacket *)packet, &pktCount, &unarrivedInfoPacket)) {
         case 0:
             return; // 無効なパケットを破棄
         case -1:
             // 未着再送信要求の場合
             // 処理をする
+            LOG_MESSAGE("received resend request of unarrived packets, request ID = %d.", requestPacket->request);
             requestPacket = (struct UnarrivedInfoPacket *)packet;
             if(requested == (uint32_t)-1 || requested < requestPacket->request){ // 新しいrequestのみ処理
                 requested = requestPacket->request;
@@ -598,27 +623,35 @@ void trans_packet(int to_inner, int sock, struct sockaddr_in* addr, struct Packe
                         continue;
                     }
                     // 到着していないパケットを再送する
+                    LOG_MESSAGE("resend unarrived packet, %d to peer", i);
                     send_packet(sendCount, peer_sock, peer_addr, (struct Packet*)taggedPacketPtr(i));
                 }
-                return;
             }
+            return;
         }
-        printf("Received valid packet from forward destination, sending back to source...\n");
+        LOG_MESSAGE("Received valid packet from forward destination, sending back to source...\n");
+        LOG_MESSAGE("addr->sin_port = %d\n", addr->sin_port);
+        LOG_MESSAGE("pktCount = %d\n", pktCount);
+        LOG_MESSAGE("rpacket_index_bottom = %d\n", rpacket_index_bottom);
         if (addr->sin_port != 0)
-            for (size_t i = rpacket_index_bottom; i < rpacket_index_bottom + pktCount; ++i){
+            for (size_t i = rpacket_index_bottom - pktCount; i < rpacket_index_bottom; ++i){
                 // 転送先にパケットを送信
-                if(!isUnarrivedMax(i)) // 再送要求限度を超えても到着していないパケット番号をスキップ
+                if(!isUnarrivedMax(i)){ // 再送要求限度を超えても到着していないパケット番号をスキップ
+                    LOG_MESSAGE("send_packet, %d to forward destination", i);
                     send_packet(1, sock, addr, (struct Packet*)bufferedPacketPtr(i));
+                }
             }
-        if (unrarrivedInfoPacket.packet_len > 0) {
+        if (unarrivedInfoPacket.packet_len > 0) {
             // 到着していないパケット番号を返送
-            send_packet(sendCount, peer_sock, peer_addr, (struct Packet*)&unrarrivedInfoPacket);
+            LOG_MESSAGE("send_packet to peer : request of unarrived %d packets", unarrivedInfoPacket.packet_len);
+            send_packet(sendCount, peer_sock, peer_addr, (struct Packet*)&unarrivedInfoPacket);
         }
     }else{
         // パケットサイズとUNIX時刻とシリアル番号を付加する
         // packet_snoをインクリメント
         add_timestamp_and_sno(packet);
         pktCount = 1;
+        LOG_MESSAGE("send_packet, %u with timestamp, %ld and sno, %d with size = %d\n", packet_sno - 1, be64toh(taggedPacketPtr(packet_sno - 1)->time), ntohl(taggedPacketPtr(packet_sno - 1)->sno), taggedPacketPtr(packet_sno - 1)->packet_len);
         send_packet(sendCount, sock, addr, (struct Packet*)taggedPacketPtr(packet_sno - 1)); // taggedPacketsのポインタを取得
     }
 
@@ -629,6 +662,28 @@ uint64_t last_call_time = 0;
 
 int main(int argc, char *argv[]) {
     program_invocation_short_name = basename(argv[0]);
+
+    // ログディレクトリを作成
+    const char *log_dir = "~/.log";
+    char resolved_log_dir[256];
+    resolve_path(log_dir, resolved_log_dir, sizeof(resolved_log_dir));
+    struct stat st;
+    if (stat(resolved_log_dir, &st) != 0) {
+        if (mkdir(resolved_log_dir, 0755) < 0) {
+            fprintf(stderr, "Error: Could not create log directory %s: %s\n", resolved_log_dir, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // ログファイルをオープン
+    const char *log_path = "~/.log/udp_repeater.log";
+    char resolved_log_path[256];
+    resolve_path(log_path, resolved_log_path, sizeof(resolved_log_path));
+    log_file = fopen(resolved_log_path, "a");
+    if (!log_file) {
+        fprintf(stderr, "Error: Could not open log file %s: %s\n", resolved_log_path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
     // コマンドライン引数を解析
     for (int i = 1; i < argc; i++) {
@@ -664,14 +719,14 @@ int main(int argc, char *argv[]) {
     }
         
     if (sendCount <= 0 || listen_port <= 0 || bind_port <= 0 || forward_port <= 0) {
-        log_and_exit("Error: Repeat count and Ports must be positive integers.");
+        LOG_AND_EXIT("Error: Repeat count and Ports must be positive integers.");
     }
 
     // tを現在時刻で初期化
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     current_time = (uint64_t)ts.tv_sec;
-    printf("Initialized current_time: %lu\n", current_time);
+    LOG_MESSAGE("Initialized current_time: %lu\n", current_time);
 
     char resolved_source_path[256];
     resolve_path(SOURCE_FILE, resolved_source_path, sizeof(resolved_source_path));
@@ -679,7 +734,7 @@ int main(int argc, char *argv[]) {
     // パイプを作成
     int pipe_fds[2];
     if (pipe(pipe_fds) < 0) {
-        log_and_exit("Error creating pipe: %s", strerror(errno));
+        LOG_AND_EXIT("Error creating pipe: %s", strerror(errno));
     }
     fr = pipe_fds[0]; // 読み取り用
     fw = pipe_fds[1]; // 書き込み用
@@ -687,7 +742,7 @@ int main(int argc, char *argv[]) {
     // 別スレッドを作成
     pthread_t thread_id;
     if (pthread_create(&thread_id, NULL, timer_thread, NULL) != 0) {
-        log_and_exit("Error creating thread: %s", strerror(errno));
+        LOG_AND_EXIT("Error creating thread: %s", strerror(errno));
     }
 
     int listen_sock, forward_sock;
@@ -701,6 +756,8 @@ int main(int argc, char *argv[]) {
 
     // 保存された送信元情報をファイルから読み込む
     FILE *file = fopen(resolved_source_path, "r");
+    printf("Loading source from %s\n", resolved_source_path);
+    LOG_MESSAGE("Loading source from %s\n", resolved_source_path);
     if (file) {
         char ip[INET_ADDRSTRLEN];
         int port;
@@ -708,14 +765,15 @@ int main(int argc, char *argv[]) {
             saved_client_addr.sin_family = AF_INET;
             saved_client_addr.sin_addr.s_addr = inet_addr(ip);
             saved_client_addr.sin_port = htons(port);
-            printf("Loaded source: %s:%d\n", ip, port);
+            puts(ip);
+            LOG_MESSAGE("Loaded source: %s:%d\n", ip, port);
         }
         fclose(file);
     }
 
     // 待ち受け用ソケットの作成
     if ((listen_sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        log_and_exit("Error creating listen socket: %s", strerror(errno));
+        LOG_AND_EXIT("Error creating listen socket: %s", strerror(errno));
     }
 
     memset(&listen_addr, 0, sizeof(listen_addr));
@@ -724,12 +782,12 @@ int main(int argc, char *argv[]) {
     listen_addr.sin_port = htons(listen_port);
 
     if (bind(listen_sock, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
-        log_and_exit("Error binding listen socket: %s", strerror(errno));
+        LOG_AND_EXIT("Error binding listen socket: %s", strerror(errno));
     }
 
     // 転送用ソケットの作成
     if ((forward_sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        log_and_exit("Error creating forward socket: %s", strerror(errno));
+        LOG_AND_EXIT("Error creating forward socket: %s", strerror(errno));
     }
 
     // サーバー名をIPv4アドレスに解決
@@ -738,11 +796,11 @@ int main(int argc, char *argv[]) {
     hints.ai_family = AF_INET; // IPv4
     hints.ai_socktype = SOCK_DGRAM; // UDP
 
-    char port_str[6];
+    char port_str[12];
     snprintf(port_str, sizeof(port_str), "%d", forward_port);
 
     if (getaddrinfo(forward_host, port_str, &hints, &res) != 0) {
-        log_and_exit("Error resolving forward address: %s", strerror(errno));
+        LOG_AND_EXIT("Error resolving forward address: %s", strerror(errno));
     }
 
     // 転送先アドレスを設定
@@ -756,10 +814,10 @@ int main(int argc, char *argv[]) {
     bind_addr.sin_port = htons(bind_port);
 
     if (bind(forward_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        log_and_exit("Error binding forward socket: %s", strerror(errno));
+        LOG_AND_EXIT("Error binding forward socket: %s", strerror(errno));
     }
 
-    printf("Listening on port %d and forwarding to %s:%d\n", listen_port, forward_host, forward_port);
+    LOG_MESSAGE("Listening on port %d and forwarding to %s:%d\n", listen_port, forward_host, forward_port);
 
 
     while (1) {
@@ -786,7 +844,7 @@ int main(int argc, char *argv[]) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             current_time = (uint64_t)ts.tv_sec;
-            printf("Updated current_time: %lu\n", current_time);
+            LOG_MESSAGE("Updated current_time: %lu\n", current_time);
         }
 
         struct Packet packet;
@@ -797,7 +855,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            printf("Received packet from %s:%d, forwarding...\n",
+            LOG_MESSAGE("Received packet from %s:%d, forwarding...\n",
                    inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
             // 送信元情報を保存
@@ -835,7 +893,7 @@ int main(int argc, char *argv[]) {
             
                     // 前回の着信検出から3秒以内の場合はスキップ
                     if (current_time - last_call_time < 3) {
-                        printf("Skipping get_url: Last call detected %lu seconds ago.\n", current_time - last_call_time);
+                        LOG_MESSAGE("Skipping get_url: Last call detected %lu seconds ago.\n", current_time - last_call_time);
                         continue;
                     }
             
