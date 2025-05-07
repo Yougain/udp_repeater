@@ -37,7 +37,7 @@ FILE *log_file = NULL;
 const char* program_invocation_short_name = NULL;
 
 // ログ出力用関数
-void log_message(const char *format, ...) {
+void log_message(const char *file, const uint32_t line, const char *format, ...) {
     if (!log_file) return;
 
     struct timeval tv;
@@ -57,18 +57,26 @@ void log_message(const char *format, ...) {
     // ログメッセージをフォーマット
     va_list args;
     va_start(args, format);
-    fprintf(log_file, "[%s.%03ld] [%s:%d] ", time_buffer, milliseconds, process_name, pid);
+    fprintf(log_file, "%s.%03ld %s[%d] ", time_buffer, milliseconds, process_name, pid);
+    fprintf(stderr, "%s.%03ld %s[%d] ", time_buffer, milliseconds, process_name, pid);
+    fprintf(log_file, "%s:%d ", file, line);
+    fprintf(stderr, "%s:%d ", file, line);
     vfprintf(log_file, format, args);
+    vfprintf(stderr, format, args);
     fprintf(log_file, "\n");
+    fprintf(stderr, "\n");
     va_end(args);
 
     fflush(log_file); // ログを即時書き込み
 }
 
+#define LOG_MESSAGE(format, ...) \
+    log_message(__FILE__, __LINE__, format, ##__VA_ARGS__)
+
 void log_and_exit(const char *format, ...) {
     va_list args;
     va_start(args, format);
-    log_message(format, args);
+    LOG_MESSAGE(format, args);
     va_end(args);
     exit(EXIT_FAILURE);
 }
@@ -84,7 +92,7 @@ int parse_url(const char *url, char *hostname, char *path, uint16_t *port) {
     if (strncmp(temp_url, "http://", 7) == 0) {
         temp_url += 7; // "http://"をスキップ
     } else if (strncmp(temp_url, "https://", 8) == 0) {
-        log_message("Error: HTTPS is not supported in this implementation.");
+        LOG_MESSAGE("Error: HTTPS is not supported in this implementation.");
         return -1;
     }
 
@@ -127,7 +135,7 @@ void get_url(char *hostname, char *path, uint16_t port) {
 
     // ホスト名を解決
     if (getaddrinfo(hostname, port_str, &hints, &res) != 0) {
-        log_message("Error resolving hostname: %s", strerror(errno));
+        LOG_MESSAGE("Error resolving hostname: %s", strerror(errno));
         return;
     }
 
@@ -136,13 +144,13 @@ void get_url(char *hostname, char *path, uint16_t port) {
         if (rp->ai_family == AF_INET || rp->ai_family == AF_INET6) {
             sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (sock < 0) {
-                log_message("Error creating socket: %s", strerror(errno));
+                LOG_MESSAGE("Error creating socket: %s", strerror(errno));
                 continue; // 次のアドレスを試す
             }
 
             // サーバーに接続
             if (connect(sock, rp->ai_addr, rp->ai_addrlen) < 0) {
-                log_message("Error connecting to server: %s", strerror(errno));
+                LOG_MESSAGE("Error connecting to server: %s", strerror(errno));
                 close(sock); // 接続失敗時はソケットを閉じる
                 continue;
             }
@@ -152,7 +160,7 @@ void get_url(char *hostname, char *path, uint16_t port) {
     }
 
     if (rp == NULL) {
-        log_message("Error: get_url: Could not connect to any address for %s", hostname);
+        LOG_MESSAGE("Error: get_url: Could not connect to any address for %s", hostname);
         freeaddrinfo(res);
         return;
     }
@@ -170,22 +178,21 @@ void get_url(char *hostname, char *path, uint16_t port) {
 
     // リクエストを送信
     if (send(sock, request, strlen(request), 0) < 0) {
-        log_message("Error sending request: %s", strerror(errno));
+        LOG_MESSAGE("Error sending request: %s", strerror(errno));
         close(sock);
         return;
     }
 
     // レスポンスを受信
-    printf("Response:\n");
     ssize_t bytes_received;
     while ((bytes_received = recv(sock, response, sizeof(response) - 1, 0)) > 0) {
         response[bytes_received] = '\0'; // NULL終端
-        printf("%s", response);         // レスポンスを出力
+        LOG_MESSAGE("Response of %s:%u/%s: %s", hostname, port, path, response);         // レスポンスを出力
     }
 
     // レスポンス受信時のエラー
     if (bytes_received < 0) {
-        log_message("Error receiving response: %s", strerror(errno));
+        LOG_MESSAGE("Error receiving response: %s", strerror(errno));
     }
 
     // ソケットを閉じる
@@ -291,7 +298,7 @@ void parse_information_elements(const unsigned char *data, int data_len, iax_cal
         
         /* バッファオーバーフローチェック */
         if (pos + ie_length > data_len) {
-            printf("Warning: IE length exceeds packet bounds\n");
+            LOG_MESSAGE("Warning: IE length exceeds packet bounds");
             break;
         }
         
@@ -350,7 +357,7 @@ int detect_incoming_call(const unsigned char *packet, int packet_len, iax_call_i
     if (header.frametype == IAX_FRAMETYPE_IAX && header.subclass == IAX_SUBCLASS_NEW) {
         /* NEW メッセージ（新規着信） */
         is_incoming_call = 1;
-        printf("Detected NEW call\n");
+        LOG_MESSAGE("Detected NEW call");
         
         /* 情報要素の解析 */
         parse_information_elements(packet + 12, packet_len - 12, call_info);
@@ -358,7 +365,7 @@ int detect_incoming_call(const unsigned char *packet, int packet_len, iax_call_i
     } else if (header.frametype == IAX_FRAMETYPE_CONTROL && header.subclass == IAX_SUBCLASS_RINGING) {
         /* RINGING メッセージ（呼出中） */
         is_incoming_call = 2;
-        printf("Detected RINGING\n");
+        LOG_MESSAGE("Detected RINGING");
     }
     
     return is_incoming_call;
@@ -557,9 +564,9 @@ void send_packet(int count, int sock, struct sockaddr_in* addr, struct Packet* p
         ssize_t sent_len = sendto(sock, packet->data, packet->packet_len, 0,
                                 (struct sockaddr *)addr, sizeof(*addr));
         if (sent_len < 0) {
-            log_message("Error sending packet: %s", strerror(errno));
+            LOG_MESSAGE("Error sending packet: %s", strerror(errno));
         } else {
-            log_message("Sent packet with timestamp %lu and sno %u to forward destination.\n", current_time, packet_sno - 1);
+            LOG_MESSAGE("Sent packet with timestamp %lu and sno %u to forward destination.\n", current_time, packet_sno - 1);
         }
     }
 }
@@ -567,6 +574,7 @@ void send_packet(int count, int sock, struct sockaddr_in* addr, struct Packet* p
 
 void trans_packet(int to_inner, int sock, struct sockaddr_in* addr, struct Packet* packet, int peer_sock, struct sockaddr_in* peer_addr) {
     size_t pktCount;
+    struct UnarrivedInfoPacket* requestPacket;
     struct UnarrivedInfoPacket unrarrivedInfoPacket;
     if (to_inner) {
         // パケットを検証して先頭のUNIX時刻とシリアル番号を削除。パケットバッファに格納して、連続している受信済パケットの範囲をpbufferとpktCountに返す
@@ -576,7 +584,7 @@ void trans_packet(int to_inner, int sock, struct sockaddr_in* addr, struct Packe
         case -1:
             // 未着再送信要求の場合
             // 処理をする
-            struct UnarrivedInfoPacket* requestPacket = (struct UnarrivedInfoPacket *)packet;
+            requestPacket = (struct UnarrivedInfoPacket *)packet;
             if(requested == (uint32_t)-1 || requested < requestPacket->request){ // 新しいrequestのみ処理
                 requested = requestPacket->request;
                 uint32_t i;
@@ -586,7 +594,7 @@ void trans_packet(int to_inner, int sock, struct sockaddr_in* addr, struct Packe
                         break; // 到着していないパケット番号の終端を示す
                     if (i < packet_sno - 1024 || packet_sno <= i) {
                         // 到着していないパケット番号が範囲外の場合
-                        log_message("Invalid unarrived packet number: %u\n", i);
+                        LOG_MESSAGE("Invalid unarrived packet number: %u\n", i);
                         continue;
                     }
                     // 到着していないパケットを再送する
@@ -765,7 +773,7 @@ int main(int argc, char *argv[]) {
         // selectでソケットとパイプを監視
         int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
         if (activity < 0 && errno != EINTR) {
-            log_message("Error in select: %s", strerror(errno));
+            LOG_MESSAGE("Error in select: %s", strerror(errno));
             break;
         }
 
@@ -785,7 +793,7 @@ int main(int argc, char *argv[]) {
         if (FD_ISSET(listen_sock, &read_fds)) {
             // 待ち受けソケットからパケットを受信
             if (recvFrom(&packet, listen_sock, &client_addr, &addr_len) < 0) {
-                log_message("Error receiving packet on listen socket: %s", strerror(errno));
+                LOG_MESSAGE("Error receiving packet on listen socket: %s", strerror(errno));
                 continue;
             }
 
@@ -809,7 +817,7 @@ int main(int argc, char *argv[]) {
         if (FD_ISSET(forward_sock, &read_fds)) {
             // 転送用ソケットからパケットを受信
             if (recvFrom(&packet, forward_sock, NULL, NULL) < 0){
-                log_message("Error receiving packet on forward socket: %s", strerror(errno));
+                LOG_MESSAGE("Error receiving packet on forward socket: %s", strerror(errno));
                 continue;
             }
 
@@ -837,7 +845,7 @@ int main(int argc, char *argv[]) {
                     // URL情報をスレッドに渡すために構造体を作成
                     UrlInfo *url_info = malloc(sizeof(UrlInfo));
                     if (!url_info) {
-                        log_message("Error allocating memory for URL info: %s", strerror(errno));
+                        LOG_MESSAGE("Error allocating memory for URL info: %s", strerror(errno));
                         continue;
                     }
 
@@ -850,7 +858,7 @@ int main(int argc, char *argv[]) {
                     // スレッドを作成してget_urlを実行
                     pthread_t thread_id;
                     if (pthread_create(&thread_id, NULL, get_url_thread, url_info) != 0) {
-                        log_message("Error creating thread for get_url: %s", strerror(errno));
+                        LOG_MESSAGE("Error creating thread for get_url: %s", strerror(errno));
                         free(url_info); // スレッド作成に失敗した場合はメモリを解放
                     } else {
                         pthread_detach(thread_id); // スレッドをデタッチ
