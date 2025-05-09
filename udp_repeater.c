@@ -1,3 +1,4 @@
+#define NO_BUFFER 1
 #define _POSIX_C_SOURCE 200809L
 
 # if __BYTE_ORDER == __LITTLE_ENDIAN
@@ -33,6 +34,64 @@
 #include <libgen.h> // For program_invocation_short_name
 #include <sys/stat.h>  // stat, mkdir関数のために必要
 #include <sys/types.h> // stat構造体のために必要
+#include <signal.h>
+#include <fcntl.h>
+
+// デーモン化する関数
+void daemonize() {
+    pid_t pid;
+
+    // 子プロセスを作成
+    pid = fork();
+    if (pid < 0) {
+        perror("fork failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // 親プロセスを終了
+    if (pid > 0) {
+        exit(EXIT_SUCCESS);
+    }
+
+    // 新しいセッションを作成
+    if (setsid() < 0) {
+        perror("setsid failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // SIGHUPとSIGTERMを無視
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+
+    // 子プロセスを作成して親プロセスを終了
+    pid = fork();
+    if (pid < 0) {
+        perror("fork failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (pid > 0) {
+        exit(EXIT_SUCCESS);
+    }
+
+    // ファイルモードマスクをリセット
+    umask(0);
+
+
+    // 標準入出力を/dev/nullにリダイレクト
+    int fd = open("/dev/null", O_RDWR);
+    if (fd < 0) {
+        perror("open /dev/null failed");
+        exit(EXIT_FAILURE);
+    }
+    dup2(fd, STDIN_FILENO);
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    if (fd > STDERR_FILENO) {
+        close(fd);
+    }
+}
+
 
 uint64_t program_start_time = 0; // プログラムの起動時刻を格納する変数
 pid_t program_pid = 0; // プログラムのプロセスIDを格納する変数
@@ -967,7 +1026,8 @@ int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, str
     }else if(bufferedPacketPtr(p_sno)->packet_len > 0 && bufferedPacketPtr(p_sno)->packet_len < (uint16_t)-16) {
         LOG_MESSAGE("validate_and_strip_packet: packet sno %d already arrived.", p_sno);
         return 0; // 無効なパケット。既にデータが到着している。
-    }
+    }else if(NO_BUFFER)
+        return 0;
 
     // パケットのサイズ（UNIX時刻とシリアル番号を除いたサイズ）を計算
     uint16_t payload_size = len - TAG_SIZE;
@@ -977,6 +1037,12 @@ int validate_and_strip_packet(struct TaggedPacket* packet, size_t *pktCount, str
     bufferedPacketPtr(p_sno)->packet_len = payload_size; // 先頭2バイトにサイズを格納
     memcpy(bufferedPacketPtr(p_sno)->data, packet->data, payload_size); // 内容を格納
 
+    if(NO_BUFFER){
+        *pktCount = 1;
+        rpacket_index_bottom = rpacket_index_top - 1;
+        return 1;
+    }
+        
     //--------連続したパケットをpbufferとpktCountで指定する---------------
     uint32_t i = rpacket_index_bottom, j = 0;
     for(; i < rpacket_index_top; ++i)
@@ -1084,18 +1150,27 @@ void trans_packet(int to_inner, int sock, struct sockaddr_in* addr, struct Packe
         LOG_MESSAGE("addr->sin_port = %d", addr->sin_port);
         LOG_MESSAGE("transferrable packet count = %d", pktCount);
         LOG_MESSAGE("rpacket_index_bottom = %d", rpacket_index_bottom);
-        if (addr->sin_port != 0)
+        if (addr->sin_port != 0){
             for (size_t i = rpacket_index_bottom - pktCount; i < rpacket_index_bottom; ++i)
                 // 転送先にパケットを送信
                 if(!isUnarrivedMax(i)){ // 再送要求限度を超えても到着していないパケット番号をスキップ
                     LOG_MESSAGE("send_packet, %d to forward destination", i);
                     send_packet(1, sock, addr, (struct Packet*)bufferedPacketPtr(i));
                 }
-        if (unarrivedInfoPacket.packet_len > 0) {
+            while(rpacket_index_bottom + 3 < rpacket_index_top){
+                // 転送先にパケットを送信
+                if(!isUnarrivedMax(rpacket_index_bottom)){
+                    LOG_MESSAGE("send_packet, %d to forward destination", rpacket_index_bottom);
+                    send_packet(1, sock, addr, (struct Packet*)bufferedPacketPtr(rpacket_index_bottom));
+                }
+                ++rpacket_index_bottom;
+            }
+            if (unarrivedInfoPacket.packet_len > 0) {
             // 到着していないパケット番号を返送
-            itemCount = (unarrivedInfoPacket.packet_len - (uint32_t)(uint64_t)&((struct UnarrivedInfoPacket *)NULL)->unarrived) / sizeof(uint32_t);
-            LOG_MESSAGE("send_packet to peer : request of unarrived %u packets", itemCount);
-            send_packet(sendCount, peer_sock, peer_addr, (struct Packet*)&unarrivedInfoPacket);
+                itemCount = (unarrivedInfoPacket.packet_len - (uint32_t)(uint64_t)&((struct UnarrivedInfoPacket *)NULL)->unarrived) / sizeof(uint32_t);
+                LOG_MESSAGE("send_packet to peer : request of unarrived %u packets", itemCount);
+                send_packet(sendCount, peer_sock, peer_addr, (struct Packet*)&unarrivedInfoPacket);
+            }
         }
     }else{
         // パケットサイズとUNIX時刻とシリアル番号を付加する
@@ -1121,6 +1196,7 @@ uint64_t last_call_time = 0;
 
 
 int main(int argc, char *argv[]) {
+    //daemonize();
     program_invocation_short_name = basename(argv[0]);
     program_pid = getpid();
     program_start_time = get_process_start_time(program_pid);
