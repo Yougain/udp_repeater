@@ -1,4 +1,4 @@
-#define NO_BUFFER 1
+//#define NO_BUFFER 1
 #define _POSIX_C_SOURCE 200809L
 
 # if __BYTE_ORDER == __LITTLE_ENDIAN
